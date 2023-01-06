@@ -1,0 +1,1 @@
+python ../runMELOD.py --dataset CD --alpha 0.0  --lamda 0.4 --sas_prob 2
