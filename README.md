@@ -10,6 +10,8 @@ In our experiments, the Beauty, Cell Phone, Cloth, CD, Grocery and Toys datasets
 The knowledge embedding is trained on [RotatE: Knowledge Graph Embedding by Relational Rotation in Complex Space](https://github.com/DeepGraphLearning/KnowledgeGraphEmbedding).
 ## Quick Start
 You can run the model with the following code:
-·python ../runMELOD.py --dataset toys --alpha 0.1  --lamda 0.5 --sas_prob 3·
+```
+python runMELOD.py --dataset toys --alpha 0.1  --lamda 0.5 --sas_prob 3
+```
 
 
