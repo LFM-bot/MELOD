@@ -2,12 +2,15 @@ import pickle
 import logging
 import datetime
 import random
+from typing import List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
 import time as t
 import numpy as np
+from easydict import EasyDict
 
 
 def load_pickle(file_path):
@@ -54,6 +57,58 @@ def get_activate(act='relu'):
         return nn.Sigmoid()
     else:
         raise KeyError(f'Not support current activate function: {act}, please add by yourself.')
+
+
+class HyperParamDict(EasyDict):
+    def __init__(self, description=None):
+        super(HyperParamDict, self).__init__({})
+        self.description = description
+        self.attr_registered = []
+
+    def add_argument(self, param_name, type=object, default=None, action=None, choices=None, help=None):
+        param_name = self._parse_param_name(param_name)
+        if default and type:
+            assert isinstance(default, type), f'KeyError. Type of param {param_name} should be {type}.'
+        if choices:
+            assert isinstance(choices, List), f'choices should be a list.'
+            assert default in choices, f'KeyError. Please choose {param_name} from {choices}. ' \
+                                       f'Now {param_name} = {default}.'
+        if action:
+            default = self._parse_action(action)
+        if help:
+            assert isinstance(help, str), f'help should be a str.'
+        self.attr_registered.append(param_name)
+        self.__setattr__(param_name, default)
+
+    @staticmethod
+    def _parse_param_name(param_name: str):
+        index = param_name.rfind('-')  # find last pos of -, return -1 on failure
+        return param_name[index + 1:]
+
+    @staticmethod
+    def _parse_action(action):
+        action_infos = action.split('_')
+        assert action_infos[0] == 'store' and action_infos[-1] in ['false', 'true'], \
+            f"Wrong action format: {action}. Please choose from ['store_false', 'store_true']."
+        res = False if action_infos[-1] == 'true' else True
+        return res
+
+    def keys(self):
+        return self.attr_registered
+
+    def values(self):
+        return [self.get(key) for key in self.attr_registered]
+
+    def items(self):
+        return [(key, self.get(key)) for key in self.attr_registered]
+
+    def __str__(self):
+        info_str = 'HyperParamDict{'
+        param_list = []
+        for key, value in self.items():
+            param_list.append(f'({key}: {value})')
+        info_str += ', '.join(param_list) + '}'
+        return info_str
 
 
 if __name__ == '__main__':

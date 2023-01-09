@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from easydict import EasyDict
 from torch.nn.init import xavier_normal_
 from src.model.abstract_recommeder import AbstractRLRecommender
+from src.utils.utils import HyperParamDict
 
 
 class MELOD(AbstractRLRecommender):
@@ -421,37 +422,34 @@ class PointWiseFeedForward(torch.nn.Module):
 
 
 def MELOD_config():
-    model_config = EasyDict({})
-    model_config.model = 'MELOD'
-
-    # main hyper-prams
-    model_config.embed_size = 128
-    #  loss type for DIIN
-    model_config.DIIN_loss_type = 'MR'  # choices=['MR': margin rank, 'BCE': binary cross entropy]
-    model_config.alpha = 0.6  # margin alpha for DIIN loss
-    model_config.lamda = 0.5  # weight for DIIN loss
-    #  supervised action sampling strategy
-    model_config.sas_prob = 2  # choices=1:[0.4, 0.3, 0.3], 2:[0.5, 0.3, 0.2], 3:[0.8, 0.1, 0.1], 4:[1., 0., 0.]
-    model_config.freeze_kg = False  # if freeze kg embedding
-    model_config.episode_num = 1  # number of sub-sequence
-    model_config.episode_len = 3  # length of sub-sequence
-    model_config.hit_range = 100  # valid range for hit-ratio reward
-    model_config.hit_r = 1.  # positive reward value for hit-ratio reward
-    model_config.sample_size = 100  # sample from top k item, choices=[100, 200, -1:all]
-    model_config.prob_sharpen = 1.  # sharpen sampling probabilities
+    parser = HyperParamDict('MELOD default hyper-parameters')
+    parser.add_argument('--model', default='MELOD', type=str)
+    parser.add_argument('--embed_size', default=128, type=int, help='embedding size')
+    parser.add_argument('--DIIN_loss_type', default='MR', type=str, choices=['MR', 'BCE'],
+                        help='loss type for DIIN, mr: margin rank loss, bec: binary cross entropy loss')
+    parser.add_argument('--alpha', default=0.6, type=float, help='margin for DIIN loss')
+    parser.add_argument('--lamda', default=0.5, type=float, help='weight for induction loss')
+    parser.add_argument('--sas_prob', default=2, type=int, choices=[1, 2, 3, 4],
+                        help='teach sample strategy, 1:[0.4, 0.3, 0.3], 2:[0.5, 0.3, 0.2], 3:[0.8, 0.1, 0.1], '
+                             '4:[1., 0., 0.]')
+    parser.add_argument('--freeze_kg', action='store_true', help='if freeze kg embedding')
+    parser.add_argument('--episode_num', default=1, type=int, help='episode number')
+    parser.add_argument('--episode_len', default=3, type=int, help='episode length')
+    parser.add_argument('--hit_range', default=100, type=int, help='valid hit range for seq reward')
+    parser.add_argument('--sample_size', default=100, help='sample from top k item, [100, 200, -1:all]')
+    parser.add_argument('--prob_sharpen', default=1., help='sharpen sample probability')
+    parser.add_argument('--hit_r', default=1., type=float, help='reward for each hit')
 
     # transformer
-    model_config.num_blocks = 2  # number of transformer layers
-    model_config.num_heads = 2  # number of attention head
-    model_config.ffn_hidden = 2  # transformer feed-forward network hidden size
-    model_config.attn_dropout = 0.5  # attention score dropout rate
-    model_config.ffn_dropout = 0.5  # feed-forward network dropout rate
-
+    parser.add_argument('--num_blocks', default=2, type=int, help='number of transformer block')
+    parser.add_argument('--num_heads', default=2, type=int, help='number of transformer head')
+    parser.add_argument('--ffn_hidden', default=256, type=int, help='transformer ffn hidden size')
+    parser.add_argument('--attn_dropout', default=0.5, type=float, help='attention score dropout')
+    parser.add_argument('--ffn_dropout', default=0.5, type=float, help='embedding dropout probability')
     # other
-    model_config.model_type = 'Knowledge'
-    model_config.loss_type = 'CUSTOM'  # choices=['CE', 'BPR', 'BCE', 'CUSTOM']
-
-    return model_config
+    parser.add_argument('--model_type', default='Knowledge', choices=['Knowledge', 'Sequential'])
+    parser.add_argument('--loss_type', default='CUSTOM', type=str, choices=['CE', 'BPR', 'BCE','CUSTOM'])
+    return parser
 
 
 if __name__ == '__main__':

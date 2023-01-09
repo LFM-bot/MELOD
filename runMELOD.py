@@ -37,6 +37,7 @@ if __name__ == '__main__':
                         help='if filter target appearing in previous sequence')
     parser.add_argument('--use_tar_len', action='store_false', help='if use target sequence')
     parser.add_argument('--target_len', default=3, type=int, help='target length for target sequence')
+    parser.add_argument('--data_aug', action='store_false', help='data augmentation')
     # Training
     parser.add_argument('--learning_rate', default=1e-3, type=float)
     parser.add_argument('--l2', default=1e-06, type=float, help='l2 normalization')

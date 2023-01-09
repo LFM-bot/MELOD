@@ -1,6 +1,7 @@
 import argparse
 from easydict import EasyDict
 import torch.cuda
+from src.utils.utils import HyperParamDict
 
 EXP_HYPER_LIST = {'Data': {'dataset': None, 'data_aug': None, 'seq_filter_len': None, 'if_filter_target': None,
                            'use_tar_len': None, 'target_len': None, 'max_len': None},
@@ -27,61 +28,63 @@ def get_device():
 
 
 def get_default_config():
-    default_config = EasyDict({})
-
+    parser = HyperParamDict("Default hyper-parameters for training.")
     # Model
-    default_config.model = 'MELOD'  # default model name
-    default_config.model_type = 'Knowledge'  # choices=['Knowledge', 'Sequential', 'RL']
-    default_config.loss_type = 'CUSTOM'  # choices=['CE', 'BPR', 'BCE', 'CUSTOM']
-
+    parser.add_argument('--model', default='MELOD')
+    parser.add_argument('--model_type', default='Sequential', choices=['Sequential', 'Knowledge'])
     # Data
-    default_config.dataset = 'beauty'  # choices=['beauty', 'cellphone', 'cloth', ...]
-    default_config.data_aug = True  # if do sequence data augmentation
-    default_config.seq_filter_len = 3  # threshold to filter short sequences
-    default_config.if_filter_target = True  # if filter target item appearing in previous item sequence'
-    default_config.use_tar_len = False  # if use multi-step target sequence
-    default_config.target_len = 3  # length for mult-step target sequence
-    default_config.separator = ' '  # separator to split item sequence from data file, choices=[' ', ',']
-    default_config.max_len = 50  # max item sequence length
-    default_config.graph_type = None  # choices=['None', 'BIPARTITE', 'TRANSITION']
-
+    parser.add_argument('--dataset', default='toys', type=str,
+                        choices=['beauty', 'cellphone', 'cloth', 'cd', 'grocery', 'yelp', 'toys'])
+    parser.add_argument('--data_aug', action='store_false', help='data augmentation')
+    parser.add_argument('--target_len', default=3, type=int, help='target length for target sequence')
+    parser.add_argument('--use_tar_len', action='store_false', help='if use target sequence')
+    parser.add_argument('--seq_filter_len', default=3, type=int, help='filter seq less than 3')
+    parser.add_argument('--if_filter_target', action='store_false',
+                        help='if filter target appearing in previous sequence')
+    parser.add_argument('--separator', default=' ', type=str, help='separator to split item sequence')
+    parser.add_argument('--graph_type', default='None', type=str, help='do not use graph',
+                        choices=['None', 'BIPARTITE', 'TRANSITION'])
+    parser.add_argument('--max_len', default=50, type=int, help='max sequence length')
     # Pretraining
-    default_config.do_pretraining = False  # if do pretraining
-    default_config.pretraining_task = 'MISP'  # choices=[None, 'MISP', 'MIM', 'PID']
-    # MISP: Mask Item Prediction and Mask Segment Prediction
-    # MIM: Mutual Information Maximization
-    # PID: Pseudo Item Discrimination
-    default_config.pretraining_epoch = 10
-    default_config.pretraining_batch = 512
-    default_config.pretraining_lr = 1e-3
-    default_config.pretraining_l2 = 0.
-
+    parser.add_argument('--do_pretraining', default=False, action='store_true')
+    parser.add_argument('--pretraining_task', default='MISP', type=str, choices=['MISP', 'MIM', 'PID'],
+                        help='pretraining task:' \
+                             'MISP: Mask Item Prediction and Mask Segment Prediction' \
+                             'MIM: Mutual Information Maximization' \
+                             'PID: Pseudo Item Discrimination'
+                        )
+    parser.add_argument('--pretraining_epoch', default=10, type=int)
+    parser.add_argument('--pretraining_batch', default=512, type=int)
+    parser.add_argument('--pretraining_lr', default=1e-3, type=float)
+    parser.add_argument('--pretraining_l2', default=0., type=float, help='l2 normalization')
     # Training
-    default_config.epoch_num = 100
-    default_config.train_batch = 512
-    default_config.learning_rate = 1e-3
-    default_config.l2 = 0.
-    default_config.patience = 5  # early stop patience
-    default_config.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'  # choices=['cuda:0', 'cpu']
-    default_config.num_worker = 0  # num_workers for dataloader
+    parser.add_argument('--epoch_num', default=100, type=int)
+    parser.add_argument('--train_batch', default=512, type=int)
+    parser.add_argument('--learning_rate', default=1e-3, type=float)
+    parser.add_argument('--l2', default=0., type=float, help='l2 normalization')
+    parser.add_argument('--patience', default=5, help='early stop patience')
+    parser.add_argument('--device', default=get_device(), choices=['cuda:0', 'cpu'],
+                        help='training on gpu or cpu, default gpu')
+    parser.add_argument('--num_worker', default=0, type=int,
+                        help='num_workers for dataloader, best: 6')
 
     # Evaluation
-    default_config.eval_batch = 512 
-    default_config.split_type = 'valid_and_test'  # choices=['valid_only', 'valid_and_test']
-    default_config.split_mode = 'LS_R@0.2'  # how to split sequence data, choices=['LS', 'LS_R@0.x', 'PS']
-    # LS: Leave-one-out splitting, last item for test, second item for eval, rest for training.
-    # LS_R@0.2: use LS to split train and test, then split 0.x data from test set for eval if use valid_and_test.
-    # PS: Pre-Splitting, prepare xx.train and xx.eval, and xx.test is needed if use valid_and_test
-    default_config.eval_mode = 'uni100'  # choices=[unixx: random neg sample, popxx: pop-based neg sample, full: all]
-    default_config.metric = ['hit', 'ndcg']  # choices='[hit, ndcg, mrr, recall]'
-    default_config.k = [5, 10]  # top k for each metric
-    default_config.valid_metric = 'hit@10'  # metric to apply early stop
+    parser.add_argument('--split_type', default='valid_and_test', choices=['valid_only', 'valid_and_test'])
+    parser.add_argument('--split_mode', default='LS_R0.2', type=str,
+                        help='LS: Leave-one-out splitting.'
+                             'LS_R@0.2: use LS and a ratio 0.x of test data for validate if use valid_and_test.'
+                             'PS: Pre-Splitting, prepare xx.train and xx.eval, also xx.test if use valid_and_test')
+    parser.add_argument('--eval_mode', default='uni100', help='[uni100, pop100, full]')
+    parser.add_argument('--metric', default=['hit', 'ndcg'], help='[hit, ndcg, mrr, recall]')
+    parser.add_argument('--k', default=[5, 10], help='top k for each metric')
+    parser.add_argument('--valid_metric', default='hit@10', help='specifies which indicator to apply early stop')
+    parser.add_argument('--eval_batch', default=512, type=int)
 
     # save
-    default_config.log_save = 'log'  # log saving path
-    default_config.model_save = 'save'  # model saving path
+    parser.add_argument('--log_save', default='log', type=str, help='log saving path')
+    parser.add_argument('--model_save', default='save', type=str, help='model saving path')
 
-    return default_config
+    return parser
 
 
 def config_override(cmd_config, model_config=None):
@@ -107,6 +110,4 @@ def config_override(cmd_config, model_config=None):
 
 if __name__ == '__main__':
     config = get_default_config()
-    print(config.use_tar_len)
-    arr = [1, 2, 3]
-    print(arr[2: 5])
+    print(config.data_aug)
