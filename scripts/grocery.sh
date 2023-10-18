@@ -1,0 +1,1 @@
+python ../runMELOD.py --dataset grocery --alpha 0.2  --lamda 0.2 --sas_prob 3
