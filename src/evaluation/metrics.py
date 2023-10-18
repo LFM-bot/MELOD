@@ -1,9 +1,10 @@
+import numpy as np
 import torch
 
 
 class Metric:
     @staticmethod
-    def calc_HIT(prediction, target, k):
+    def HIT(prediction, target, k):
         """
         calculate Hit-Ratio (HR) @ k
         :param prediction: [batch, max_k], sorted along dim -1
@@ -12,12 +13,12 @@ class Metric:
         :return: average hit-ratio score among all input data
         """
         prediction, target = Metric.process(prediction, target, k)
-        hit = ((prediction - target) == 0).sum(dim=-1).float()
-        hit = hit.mean().cpu().numpy()
+        hit = ((prediction - target) == 0).sum(dim=-1).double()
+        hit = hit.sum().item()
         return hit
 
     @staticmethod
-    def calc_NDCG(prediction, target, k):
+    def NDCG(prediction, target, k):
         """
         calculate Normalized Discounted Cumulative Gain (NDCG) @ k.
         Note that the Ideal Discounted Cumulative Gain (IDCG) is equal to all users, so it can be ignored.
@@ -27,14 +28,14 @@ class Metric:
         :return: average hit-ratio score among all input data
         """
         prediction, target = Metric.process(prediction, target, k)
-        hit = ((prediction - target) == 0).sum(dim=-1).float()  # [batch_size]
+        hit = ((prediction - target) == 0).sum(dim=-1).double()  # [batch_size]
         row, col = ((prediction - target) == 0.).nonzero(as_tuple=True)  # [hit_size]
-        ndcg = hit.scatter(index=row, src=1. / torch.log2(col + 2), dim=-1)
-        ndcg = ndcg.mean().cpu().numpy()
+        ndcg = hit.scatter(index=row, src=1. / torch.log2(col + 2).double(), dim=-1)
+        ndcg = ndcg.sum().item()
         return ndcg
 
     @staticmethod
-    def calc_MRR(prediction, target, k):
+    def MRR(prediction, target, k):
         """
         calculate Mean Reciprocal Rank (MRR) @ k
         :param prediction: [batch, max_k], sorted along dim -1
@@ -43,14 +44,14 @@ class Metric:
         :return: average hit-ratio score among all input data
         """
         prediction, target = Metric.process(prediction, target, k)
-        hit = ((prediction - target) == 0).sum(dim=-1).float()  # [batch_size]
+        hit = ((prediction - target) == 0).sum(dim=-1).double()  # [batch_size]
         row, col = ((prediction - target) == 0.).nonzero(as_tuple=True)  # [hit_size]
-        mrr = hit.scatter(index=row, src=1. / (col + 1), dim=-1)
-        mrr = mrr.mean().cpu().numpy()
+        mrr = hit.scatter(index=row, src=1. / (col + 1).double(), dim=-1)
+        mrr = mrr.sum().item()
         return mrr
 
     @staticmethod
-    def calc_RECALL(prediction, target, k):
+    def RECALL(prediction, target, k):
         """
         calculate recall @ k, similar to hit-ration under SR (Sequential recommendation) setting
         :param prediction: [batch, max_k], sorted along dim -1
@@ -58,7 +59,7 @@ class Metric:
         :param k: scalar
         :return: average hit-ratio score among all input data
         """
-        return Metric.calc_HIT(prediction, target, k)
+        return Metric.HIT(prediction, target, k)
 
     @staticmethod
     def process(prediction, target, k):

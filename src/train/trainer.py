@@ -1,15 +1,18 @@
 import logging
+import os
+
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
 from src.dataset import dataset
 from src.dataset.dataset import load_specified_dataset
 from src.dataset.data_processor import DataProcessor
-from src.evaluation.estimator import Estimator
+from src.evaluation.estimator import Estimator, load_estimator
 from src.utils.recorder import Recorder
 import src.model as model
 from src.train.config import experiment_hyper_load, config_override
+from src.utils.utils import set_seed, batch_to_device
 
 
 class Trainer:
@@ -17,8 +20,7 @@ class Trainer:
         self.config = config
         self.model_name = config.model
         self._config_override(self.model_name, config)
-
-        # pretraining args
+        # pretraining
         self.pretraining_model = None
         self.do_pretraining = self.config.do_pretraining
         self.pretraining_task = self.config.pretraining_task
@@ -27,9 +29,8 @@ class Trainer:
         self.pretraining_lr = self.config.pretraining_lr
         self.pretraining_l2 = self.config.pretraining_l2
 
-        # training args
+        # training
         self.training_model = None
-        self.user_target_len = self.config.use_tar_len
         self.num_worker = self.config.num_worker
         self.train_batch = self.config.train_batch
         self.eval_batch = self.config.eval_batch
@@ -39,32 +40,45 @@ class Trainer:
         self.dev = torch.device(self.config.device)
         self.split_type = self._set_split_mode(self.config.split_type)
         self.do_test = self.split_type == 'valid_and_test'
-        self.num_items = 0
 
-        # main components
+        # components
         self.data_processor = DataProcessor(self.config)
-        self.estimator = Estimator(self.config)
+        self.estimator = load_estimator(self.config)
         self.recorder = Recorder(self.config)
 
-        # load data
-        self.data_pair_dict = self.data_processor.prepare_data()
+        # set random seed
+        set_seed(self.config.seed)
+
+        # preparing data
+        data_dict, additional_data_dict = self.data_processor.prepare_data()
+        self.data_dict = data_dict  # store standard train/eval/test data
+        self.additional_data_dict = additional_data_dict  # extra data (model specified)
+
+        #  check_duplication(self.data_dict['train'][0])
+
         self.estimator.load_item_popularity(self.data_processor.popularity)
         self._set_num_items()
 
     def start_training(self):
         if self.do_pretraining:
             self.pretraining()
+
+            # save pretrained item embeddings
+            ssl_item_emb = self.pretraining_model.item_embedding.weight[1:].detach().cpu().numpy()
+            w_file = os.path.join(self.data_processor.data_path, f'{self.data_processor.dataset}_ssl.npy')
+            np.save(w_file, ssl_item_emb)
+            return
         self.training()
 
     def pretraining(self):
-
         if self.pretraining_task in ['MISP', 'MIM', 'PID']:
             pretrain_dataset = getattr(dataset, f'{self.pretraining_task}PretrainDataset')
-            pretrain_dataset = pretrain_dataset(self.num_items, self.config, self.data_pair_dict['train'])
+            pretrain_dataset = pretrain_dataset(self.config, self.data_dict['train'],
+                                                self.additional_data_dict)
         else:
             raise NotImplementedError(f'No such pretraining task: {self.pretraining_task}, '
                                       f'choosing from [MIP, MIM, PID]')
-        train_loader = DataLoader(pretrain_dataset, batch_size=self.train_batch,
+        train_loader = DataLoader(pretrain_dataset, batch_size=self.train_batch, collate_fn=pretrain_dataset.collate_fn,
                                   shuffle=True, num_workers=0, drop_last=False)
 
         pretrain_model = self._load_model()
@@ -81,9 +95,9 @@ class Trainer:
             self.recorder.tik_start()
             train_iter = tqdm(enumerate(train_loader), total=len(train_loader))
             train_iter.set_description(f'pretraining  epoch: {epoch}')
-            for i, batch in train_iter:
-                batch = (t.to(self.dev) for t in batch)
-                loss = getattr(pretrain_model, f'{self.pretraining_task}_pretrain_forward')(*batch)
+            for i, batch_dict in train_iter:
+                batch_to_device(batch_dict, self.dev)
+                loss = getattr(pretrain_model, f'{self.pretraining_task}_pretrain_forward')(batch_dict)
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -96,14 +110,15 @@ class Trainer:
         logging.info('Pre-training is over, prepare for training...')
 
     def training(self):
-
         SpecifiedDataSet = load_specified_dataset(self.model_name, self.config)
-        train_dataset = SpecifiedDataSet(self.num_items, self.config, self.data_pair_dict['train'])
-        train_loader = DataLoader(train_dataset, batch_size=self.train_batch,
-                                  shuffle=True, num_workers=0, drop_last=False)
+        train_dataset = SpecifiedDataSet(self.config, self.data_dict['train'],
+                                         self.additional_data_dict)
+        train_loader = DataLoader(train_dataset, batch_size=self.train_batch, collate_fn=train_dataset.collate_fn,
+                                  shuffle=True, num_workers=self.num_worker, drop_last=False)
 
-        eval_dataset = SpecifiedDataSet(self.num_items, self.config, self.data_pair_dict['eval'], train=False)
-        eval_loader = DataLoader(eval_dataset, batch_size=self.eval_batch,
+        eval_dataset = SpecifiedDataSet(self.config, self.data_dict['eval'],
+                                        self.additional_data_dict, train=False)
+        eval_loader = DataLoader(eval_dataset, batch_size=self.eval_batch, collate_fn=eval_dataset.collate_fn,
                                  shuffle=False, num_workers=self.num_worker, drop_last=False)
 
         self.training_model = self._load_model()
@@ -120,16 +135,17 @@ class Trainer:
             self.recorder.tik_start()
             train_iter = tqdm(enumerate(train_loader), total=len(train_loader))
             train_iter.set_description('training  ')
-            for i, batch in train_iter:
+            for step, batch_dict in train_iter:
                 # training forward
-                batch = (t.to(self.dev) for t in batch)
-                loss = self.training_model.train_forward(*batch, epoch=i)
-                # backward propagation
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-
-                self.recorder.save_batch_loss(loss.item())
+                batch_dict['epoch'] = epoch
+                batch_dict['step'] = step
+                batch_to_device(batch_dict, self.dev)
+                loss = self.training_model.train_forward(batch_dict)
+                if torch.is_tensor(loss) and loss.requires_grad:
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+                    self.recorder.save_batch_loss(loss.item())
             self.recorder.tik_end()
             self.recorder.train_log_verbose(len(train_loader))
 
@@ -137,15 +153,15 @@ class Trainer:
             self.recorder.tik_start()
             eval_metric_result, eval_loss = self.estimator.evaluate(eval_loader, self.training_model)
             self.recorder.tik_end(mode='eval')
-            self.recorder.eval_log_verbose(eval_metric_result, eval_loss, self.training_model)
+            self.recorder.log_verbose_and_save(eval_metric_result, eval_loss, self.training_model)
 
             if self.recorder.early_stop:
                 break
 
         self.recorder.report_best_res()
-
+        # test model
         if self.do_test:
-            test_metric_res = self.test_model(self.data_pair_dict['test'])
+            test_metric_res = self.test_model(self.data_dict['test'])
             self.recorder.report_test_result(test_metric_res)
 
     def _set_split_mode(self, split_mode):
@@ -156,47 +172,43 @@ class Trainer:
         if self.do_pretraining and self.pretraining_model is not None:  # return pretraining model
             return self.pretraining_model
 
-        if self.config.model_type.lower() == 'knowledge':
-            return self._load_kg_model()
-        elif self.config.model_type.lower() == 'sequential':
+        # return new model
+        if self.config.model_type.upper() == 'SEQUENTIAL':
             return self._load_sequential_model()
-        elif self.config.model_type.lower() == 'graph':
-            return self._load_graph_model()
+        elif self.config.model_type.upper() in ['GRAPH', 'KNOWLEDGE']:
+            return self._load_model_with_additional_data()
         else:
-            pass
+            raise KeyError(f'Invalid model_type:{self.config.model_type}. Choose from [sequential, knowledge, graph]')
 
     def _load_sequential_model(self):
         Model = getattr(model, self.model_name)
-        seq_model = Model(self.num_items, self.config).to(self.dev)
-        return seq_model
+        specified_seq_model = Model(self.config, self.additional_data_dict).to(self.dev)
+        return specified_seq_model
 
-    def _load_graph_model(self):
-        # graph = self.data_processor.prepare_graph().to(self.dev)
-        graph = self.data_processor.prepare_graph()
+    def _load_model_with_additional_data(self):
         Model = getattr(model, self.model_name)
-        graph_model = Model(self.num_items, self.config, graph).to(self.dev)
-        return graph_model
-
-    def _load_kg_model(self):
-        kg_map = self.data_processor.prepare_kg_map().float().to(self.dev)
-        Model = getattr(model, self.model_name)
-        kg_model = Model(self.num_items, self.config, kg_map).to(self.dev)
-        return kg_model
+        specified_model = Model(self.config, self.additional_data_dict).to(self.dev)
+        return specified_model
 
     def _config_override(self, model_name, cmd_config):
         self.model_config = getattr(model, f'{model_name}_config')()
-        self.config = config_override(cmd_config, self.model_config)
+        self.config = config_override(self.model_config, cmd_config)
+        # capitalize
+        self.config.model_type = self.config.model_type.upper()
+        self.config.graph_type = [g_type.upper() for g_type in self.config.graph_type]
 
     def _set_num_items(self):
-        self.num_items = self.data_processor.num_items
+        self.config.num_items = self.data_processor.num_items
 
     def experiment_setting_verbose(self, model, training=True):
         if self.do_pretraining and training:
             return
         # model config
         logging.info('[1] Model Hyper-Parameter '.ljust(47, '-'))
-        for arg in self.model_config.keys():
-            logging.info(f'{arg}: {getattr(self.model_config, arg)}')
+        model_param_set = self.model_config.keys()
+        for arg in vars(self.config):
+            if arg in model_param_set:
+                logging.info(f'{arg}: {getattr(self.config, arg)}')
         # experiment config
         logging.info('[2] Experiment Hyper-Parameter '.ljust(47, '-'))
         # verbose_order = ['Data', 'Training', 'Evaluation', 'Save']
@@ -218,16 +230,23 @@ class Trainer:
         logging.info(model)
 
     def test_model(self, test_data_pair=None):
-        SpecifiedDataSet = load_specified_dataset(self.training_model, self.config)
-        test_dataset = SpecifiedDataSet(self.num_items, self.config, test_data_pair, train=False)
+        SpecifiedDataSet = load_specified_dataset(self.model_name, self.config)
+        test_dataset = SpecifiedDataSet(self.config, test_data_pair,
+                                        self.additional_data_dict, train=False)
         test_loader = DataLoader(test_dataset, batch_size=self.eval_batch, num_workers=self.num_worker,
-                                 drop_last=False, shuffle=False)
+                                 collate_fn=test_dataset.collate_fn, drop_last=False, shuffle=False)
         # load the best model
         self.recorder.load_best_model(self.training_model)
         self.training_model.eval()
         test_metric_result = self.estimator.test(test_loader, self.training_model)
 
         return test_metric_result
+
+    def start_test(self):
+        self.training_model = self._load_model()
+        self.experiment_setting_verbose(self.training_model)
+        test_metric_res = self.test_model(self.data_dict['test'])
+        self.recorder.report_test_result(test_metric_res)
 
 
 if __name__ == '__main__':

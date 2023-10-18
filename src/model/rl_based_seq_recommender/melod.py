@@ -1,19 +1,23 @@
 import argparse
+import logging
+import pickle
+import random
 import sys
 import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-from easydict import EasyDict
 from torch.nn.init import xavier_normal_
 from src.model.abstract_recommeder import AbstractRLRecommender
 from src.utils.utils import HyperParamDict
+from src.model.sequential_encoder import Transformer
 
 
 class MELOD(AbstractRLRecommender):
-    def __init__(self, num_items, config, kg_map):
-        super(MELOD, self).__init__(num_items, config)
-        # hyperparams
+    def __init__(self, config, additional_data_dict):
+        super(MELOD, self).__init__(config)
+        self.config = config
+
         self.alpha = config.alpha
         self.lamda = config.lamda
         self.sas_prob = self.set_sas_prob(config.sas_prob)
@@ -21,16 +25,17 @@ class MELOD(AbstractRLRecommender):
         self.episode_num = config.episode_num
         self.episode_len = config.episode_len
         self.embed_size = config.embed_size
-        self.sample_size = config.sample_size if config.sample_size > 0 else num_items
+        self.sample_size = config.sample_size if config.sample_size > 0 else self.num_items
         self.prob_sharpen = config.prob_sharpen
         self.hit_range = config.hit_range
         self.hit_r = 1.
         self.layer_norm_eps = 1e-12
+        self.scale = 2.
         self.device = config.device
 
-        # modules
-        self.indu_loss_func = torch.nn.MarginRankingLoss(margin=config.alpha) if self.DIIN_loss_type == 'MR' else nn.BCELoss()
-        self.kg_embedding = kg_map[: self.num_items]
+        self.indu_loss_func = torch.nn.MarginRankingLoss(
+            margin=config.alpha) if self.DIIN_loss_type == 'MR' else nn.BCELoss()
+        self.kg_embedding = additional_data_dict['kg_map'][: self.num_items]
         self.kg_embedding.requires_grad = not config.freeze_kg
         self.item_embedding = nn.Embedding(self.num_items, self.embed_size)
 
@@ -45,9 +50,7 @@ class MELOD(AbstractRLRecommender):
 
         self.W1 = nn.Linear(self.embed_size * 2, self.embed_size * 2)
         self.W2 = nn.Linear(self.embed_size * 2, 2)
-        # self.W2 = nn.Sequential(nn.Linear(self.embed_size * 2, self.embed_size),
-        #                         nn.GELU(),
-        #                         nn.Linear(self.embed_size, 2))
+
         self.emb_drop = nn.Dropout(p=config.ffn_dropout)
         self.cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
         self.apply(self._init_weights)
@@ -56,13 +59,8 @@ class MELOD(AbstractRLRecommender):
         if isinstance(module, (nn.Linear, nn.Embedding)):
             xavier_normal_(module.weight)
 
-    def forward(self, item_seq, seq_len):
-        """
-        Parameters
-        ----------
-        item_seq: torch.LongTensor, [batch_size,max_len]
-        seq_len: torch.LongTensor, [batch_size]
-        """
+    def forward(self, data_dict):
+        item_seq, seq_len = data_dict['item_seq'], data_dict['seq_len']
         # sequential state
         seq_embedding = self.item_embedding(item_seq)
         seq_embedding = self.emb_drop(seq_embedding)
@@ -76,17 +74,12 @@ class MELOD(AbstractRLRecommender):
 
         return logits
 
-    def train_forward(self, item_seq, seq_len, target, *args, **kwargs):
-        """
-        Parameters
-        ----------
-        item_seq: [batch, max_len]
-        seq_len: [batch]
-        target: [batch]
-        """
-        tar_len = args[0]  # [batch, ep_len]
+    def train_forward(self, data_dict):
+        item_seq, seq_len = data_dict['item_seq'], data_dict['seq_len']
+        target, tar_len = data_dict['target_seq'], data_dict['target_len']
         sas_prob = self.get_sas_prob(target, tar_len)
         prediction, action, reward, indu_weight = self.teach_and_explore(item_seq, target, seq_len, tar_len, sas_prob)
+
         return self.get_final_loss(prediction, action, reward, indu_weight)
 
     def teach_and_explore(self, item_seq, targets, train_len, tar_len, sas_prob):
@@ -104,9 +97,10 @@ class MELOD(AbstractRLRecommender):
 
         Returns
         -------
-        origin_prob : original probability , [batch_size,item_nums]
-        first_sample : items sampled for the first time , [batch_size]
-        reward : rewards for this sampling episode , [batch_size]
+        prob_double : original probability , [batch_size * 2,item_nums]
+        first_sample : items sampled for the first time , [batch_size * 2]
+        reward : rewards for this sampling episode , [batch_size * 2]
+        indu_factor: [batch_size * 2]
         """
         # sequential state
         seq_embeddings = self.item_embedding(item_seq)
@@ -195,7 +189,9 @@ class MELOD(AbstractRLRecommender):
             episode_items = action_taken.unsqueeze(-1)  # [batch_size, 1]
             episode_hit_reward = [self.hit_ratio_reward(initial_prob, ground_item_seq, i=0)]
             for i in range(episode_len - 1):
-                out_logits = self.forward(cur_item_seq, cur_seq_len)
+                new_data_dict = {'item_seq': cur_item_seq,
+                                 'seq_len': cur_seq_len}
+                out_logits = self.forward(new_data_dict)
                 out_logits = torch.scatter(out_logits, -1, cur_item_seq, -sys.maxsize)
                 out_prob = torch.softmax(out_logits, dim=-1)
                 cur_sample = self.sample_from_topk(out_prob, k=self.sample_size)
@@ -207,10 +203,9 @@ class MELOD(AbstractRLRecommender):
             # calculate kg reward
             episode_item_len = 3 * torch.ones(len(episode_items)).to(self.device)
             episode_kg = self.kg_encoder_avg(episode_items, episode_item_len, drop=False)  # [batch_size, dims]
-            kg_reward.append(self.normalized_cos(ground_kg, episode_kg))  # [batch_size]
+            kg_reward.append(self.cos(ground_kg, episode_kg))  # [batch_size]
             # calculate seq reward
             episode_hit_reward = torch.stack(episode_hit_reward, dim=0)  # [episode_len, batch_size]
-            # discounted_ep_reward = self.get_discount_factor().unsqueeze(-1) * episode_hit_reward
             seq_reward.append(torch.mean(episode_hit_reward, dim=0))
 
         seq_reward = torch.stack(seq_reward, dim=0)
@@ -218,7 +213,7 @@ class MELOD(AbstractRLRecommender):
         kg_reward = torch.stack(kg_reward, dim=0)  # [episode_num, batch_size]
         kg_reward = torch.mean(kg_reward, dim=0)  # [batch_size]
 
-        final_reward = (2 * seq_reward * kg_reward) / (seq_reward + kg_reward)  # harmonic mean
+        final_reward = self.scale * (2 * seq_reward * kg_reward) / (seq_reward + kg_reward)  # harmonic mean
 
         return final_reward
 
@@ -243,8 +238,10 @@ class MELOD(AbstractRLRecommender):
         if target is not None:
             ground_seq_emb = self.item_embedding(target)  # [batch_size, embed_size]
             ground_kg_emb = self.kg_embedding[target]
-            ground_kg_coef = torch.mul(final_seq_state, ground_seq_emb).sum(dim=-1)  # [batch_size]
-            ground_seq_coef = torch.mul(final_kg_state, ground_kg_emb).sum(dim=-1)
+            # ground_kg_coef = torch.mul(final_seq_state, ground_seq_emb).sum(dim=-1)  # [batch_size]
+            # ground_seq_coef = torch.mul(final_kg_state, ground_kg_emb).sum(dim=-1)
+            ground_seq_coef = torch.mul(final_seq_state, ground_seq_emb).sum(dim=-1)  # [batch_size]
+            ground_kg_coef = torch.mul(final_kg_state, ground_kg_emb).sum(dim=-1)
             ground_coef = torch.stack([ground_seq_coef, ground_kg_coef], dim=-1)  # [batch_size, 2]
             sorted_idx = torch.argsort(ground_coef, dim=-1, descending=True)
             sorted_pred_weight = torch.gather(induction_weights, dim=-1, index=sorted_idx)
@@ -263,7 +260,7 @@ class MELOD(AbstractRLRecommender):
         sample: [batch_size]
         masked_item: [batch_size, m]
         """
-        masked_prob = sample_prob
+        masked_prob = sample_prob.clone().detach()
         if masked_item is not None:
             masked_prob = torch.scatter(sample_prob, -1, masked_item, 0.)
         if k is not None:
@@ -275,12 +272,12 @@ class MELOD(AbstractRLRecommender):
         # sharpen
         if sharpen:
             masked_prob = masked_prob ** self.prob_sharpen
+
+        masked_prob -= torch.min(masked_prob, -1, keepdim=True)[0]
         sampler = torch.distributions.categorical.Categorical(masked_prob)
+
         item_sampled = sampler.sample()
         return item_sampled
-
-    def normalized_cos(self, vec1, vec2):
-        return (self.cos(vec1, vec2) + 1) / 2
 
     def hit_ratio_reward(self, prob, targets, i=0):
         """
@@ -299,20 +296,24 @@ class MELOD(AbstractRLRecommender):
             target_rank = torch.where(target_rank > self.hit_range, 0., self.hit_r)
             rank_reward += target_rank
         rank_reward[rank_reward > 1.] = 1.
+
         return rank_reward
 
-    def get_loss(self, item_input, logits, target):
+    def get_loss(self, data_dict, logits):
         return torch.zeros((1,))
 
     def get_final_loss(self, prediction, action, reward, induction_factor):
-        # DIIN loss
+        B = int(reward.size(0) / 2)
         DIIN_Loss = self.get_DIIN_loss_func(self.DIIN_loss_type, self.indu_loss_func, induction_factor)
         # RL loss
         prob = torch.index_select(prediction, 1, action)  # [batch_size * 2,batch_size]
         prob = torch.diagonal(prob, 0)  # prob for each batch, [batch_size * 2]
-        RLloss = -torch.mean(torch.mul(reward, torch.log(prob)))
+        explore_loss = -torch.mean(torch.mul(reward[:B], torch.log(prob[:B])))
+        teach_loss = -torch.mean(torch.mul(reward[B:], torch.log(prob[B:])))
+        rl_loss = teach_loss + explore_loss
 
-        loss = RLloss + self.lamda * DIIN_Loss
+        loss = rl_loss + self.lamda * DIIN_Loss
+
         return loss
 
     def set_sas_prob(self, teach_prob):
@@ -350,84 +351,13 @@ class MELOD(AbstractRLRecommender):
         return seq_embedding
 
 
-class Transformer(torch.nn.Module):
-    def __init__(self, embed_size, num_heads, num_blocks, attn_dropout, ffn_hidden, ffn_dropout, max_len, layer_norm_eps):
-        super(Transformer, self).__init__()
-        self.embed_size = embed_size
-        self.ffn_hidden = ffn_hidden
-        self.pos_emb = torch.nn.Embedding(max_len, embed_size)
-        self.emb_dropout = nn.Dropout(ffn_dropout)
-
-        self.attention_layernorms = torch.nn.ModuleList()
-        self.attention_layers = torch.nn.ModuleList()
-        self.forward_layernorms = torch.nn.ModuleList()
-        self.forward_layers = torch.nn.ModuleList()
-
-        for _ in range(num_blocks):
-            new_attn_layernorm = torch.nn.LayerNorm(embed_size, eps=layer_norm_eps)
-            self.attention_layernorms.append(new_attn_layernorm)
-
-            new_attn_layer = torch.nn.MultiheadAttention(embed_size,
-                                                         num_heads,
-                                                         attn_dropout)
-            self.attention_layers.append(new_attn_layer)
-
-            new_fwd_layernorm = torch.nn.LayerNorm(embed_size, eps=layer_norm_eps)
-            self.forward_layernorms.append(new_fwd_layernorm)
-
-            new_fwd_layer = PointWiseFeedForward(embed_size, ffn_hidden, ffn_dropout)
-            self.forward_layers.append(new_fwd_layer)
-
-    def forward(self, seq_embedding):
-        """
-        :param log_seqs: [batch_size, max_seq_len]
-        :param seq_embedding: torch.FloatTensor, [batch_size, max_seq_len, dim]
-        :return:
-        """
-        seq_embedding *= self.embed_size ** 0.5
-        positions = np.tile(np.array(range(seq_embedding.shape[1])), [seq_embedding.shape[0], 1])
-        seq_embedding += self.pos_emb(torch.LongTensor(positions).to(seq_embedding.device))
-        seqs = self.emb_dropout(seq_embedding)
-
-        seq_len = seqs.size(1)
-        attention_mask = ~torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=seqs.device))  # [max_len, max_len]
-
-        for i in range(len(self.attention_layers)):
-            seqs = torch.transpose(seqs, 0, 1)  # [max_len, batch_size, embed_size]
-            Q = self.attention_layernorms[i](seqs)
-            mha_outputs, _ = self.attention_layers[i](Q, seqs, seqs,
-                                                      attn_mask=attention_mask)
-            seqs = Q + mha_outputs
-            seqs = torch.transpose(seqs, 0, 1)
-
-            seqs = self.forward_layernorms[i](seqs)
-            seqs = self.forward_layers[i](seqs)
-
-        return seqs
-
-
-class PointWiseFeedForward(torch.nn.Module):
-    def __init__(self, embed_size, hidden_size, ffn_dropout):
-        super(PointWiseFeedForward, self).__init__()
-        self.fc1 = torch.nn.Linear(embed_size, hidden_size)
-        self.dropout1 = torch.nn.Dropout(p=ffn_dropout)
-        self.act = torch.nn.ReLU()
-        self.fc2 = torch.nn.Linear(hidden_size, embed_size)
-        self.dropout2 = torch.nn.Dropout(p=ffn_dropout)
-
-    def forward(self, inputs):
-        outputs = self.dropout2(self.fc2(self.act(self.dropout1(self.fc1(inputs)))))
-        outputs += inputs
-        return outputs
-
-
 def MELOD_config():
     parser = HyperParamDict('MELOD default hyper-parameters')
-    parser.add_argument('--model', default='MELOD', type=str)
+    parser.add_argument('--model', default='MELOD_origin', type=str)
     parser.add_argument('--embed_size', default=128, type=int, help='embedding size')
     parser.add_argument('--DIIN_loss_type', default='MR', type=str, choices=['MR', 'BCE'],
                         help='loss type for DIIN, mr: margin rank loss, bec: binary cross entropy loss')
-    parser.add_argument('--alpha', default=0.6, type=float, help='margin for DIIN loss')
+    parser.add_argument('--alpha', default=0.5, type=float, help='margin for DIIN loss')
     parser.add_argument('--lamda', default=0.5, type=float, help='weight for induction loss')
     parser.add_argument('--sas_prob', default=2, type=int, choices=[1, 2, 3, 4],
                         help='teach sample strategy, 1:[0.4, 0.3, 0.3], 2:[0.5, 0.3, 0.2], 3:[0.8, 0.1, 0.1], '
@@ -443,20 +373,10 @@ def MELOD_config():
     # transformer
     parser.add_argument('--num_blocks', default=2, type=int, help='number of transformer block')
     parser.add_argument('--num_heads', default=2, type=int, help='number of transformer head')
-    parser.add_argument('--ffn_hidden', default=256, type=int, help='transformer ffn hidden size')
+    parser.add_argument('--ffn_hidden', type=int, default=256, help='transformer ffn hidden size')
     parser.add_argument('--attn_dropout', default=0.5, type=float, help='attention score dropout')
     parser.add_argument('--ffn_dropout', default=0.5, type=float, help='embedding dropout probability')
     # other
     parser.add_argument('--model_type', default='Knowledge', choices=['Knowledge', 'Sequential'])
-    parser.add_argument('--loss_type', default='CUSTOM', type=str, choices=['CE', 'BPR', 'BCE','CUSTOM'])
+    parser.add_argument('--loss_type', default='CUSTOM', type=str, choices=['CE', 'BPR', 'BCE', 'CUSTOM'])
     return parser
-
-
-if __name__ == '__main__':
-    config = MELOD_config()
-    config.max_len = 50
-    config.device = torch.device('cuda:0')
-    num_items = 100
-    kg_map = torch.randn(100, 128)
-    model = MELOD(num_items, config, kg_map)
-    print(model)

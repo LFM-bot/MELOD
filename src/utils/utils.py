@@ -13,8 +13,34 @@ import numpy as np
 from easydict import EasyDict
 
 
+def set_seed(seed):
+    if seed == -1:
+        return
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # some cudnn methods can be random even after fixing the seed
+    # unless you tell it to be deterministic
+    torch.backends.cudnn.deterministic = True
+
+
+def batch_to_device(tensor_dict: dict, dev):
+    for key, obj in tensor_dict.items():
+        if torch.is_tensor(obj):
+            tensor_dict[key] = obj.to(dev)
+
+
 def load_pickle(file_path):
-    return pickle.load(open(file_path, 'rb'), encoding='latin1')
+    with open(file_path, 'rb') as fr:
+        return pickle.load(fr)
+
+
+def save_pickle(obj, file_path):
+    with open(file_path, 'wb') as f:
+        pickle.dump(obj, f)
 
 
 def pkl_to_txt(dataset='beauty'):
@@ -68,7 +94,10 @@ class HyperParamDict(EasyDict):
     def add_argument(self, param_name, type=object, default=None, action=None, choices=None, help=None):
         param_name = self._parse_param_name(param_name)
         if default and type:
-            assert isinstance(default, type), f'KeyError. Type of param {param_name} should be {type}.'
+            try:
+                default = type(default)
+            except Exception:
+                assert isinstance(default, type), f'KeyError. Type of param {param_name} should be {type}.'
         if choices:
             assert isinstance(choices, List), f'choices should be a list.'
             assert default in choices, f'KeyError. Please choose {param_name} from {choices}. ' \
@@ -109,6 +138,21 @@ class HyperParamDict(EasyDict):
             param_list.append(f'({key}: {value})')
         info_str += ', '.join(param_list) + '}'
         return info_str
+
+
+def get_gpu_usage(device=None):
+    r""" Return the reserved memory and total memory of given device in a string.
+    Args:
+        device: cuda.device. It is the device that the model run on.
+
+    Returns:
+        str: it contains the info about reserved memory and total memory of given device.
+    """
+
+    reserved = torch.cuda.max_memory_reserved(device) / 1024 ** 3
+    total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 3
+
+    return '{:.2f} G/{:.2f} G'.format(reserved, total)
 
 
 if __name__ == '__main__':

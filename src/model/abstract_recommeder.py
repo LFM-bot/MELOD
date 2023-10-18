@@ -4,51 +4,55 @@ import torch.nn.functional as F
 
 
 class AbstractRecommender(nn.Module):
-    def __init__(self, num_items=0, config=None):
+    def __init__(self, config):
         super(AbstractRecommender, self).__init__()
-        self.num_items = num_items
+        self.num_items = config.num_items
         self.loss_type = config.loss_type
         self.max_len = config.max_len
-        self.config = config
+        self.dev = config.device
+        self.cross_entropy = nn.CrossEntropyLoss()
 
-    def forward(self, item_seq, seq_len):
+    def forward(self, data_dict: dict):
         """
         Args:
-            item_seq: [batch, max_len]
-            seq_len: [batch]
+            data_dict: dict
         """
         pass
 
-    def train_forward(self, item_seq, seq_len, target, *args, **kwargs):
+    def train_forward(self, data_dict: dict):
         """
         Args:
-            item_seq: [batch, max_len]
-            seq_len: [batch]
-            target: [batch]
+            data_dict: dict
         """
-        prediction = self.forward(item_seq, seq_len)
-        return self.get_loss(item_seq, prediction, target)
+        logits = self.forward(data_dict)
+        return self.get_loss(data_dict, logits)
 
-    def get_loss(self, item_input, logits, target):
-        """
-        :param item_input: [batch, max_len]
-        :param logits: [batch, num_items]
-        :param target: [batch]
-        """
+    def load_basic_SR_data(self, data_dict):
+        return data_dict['item_seq'], data_dict['seq_len'], data_dict['target']
+
+    def get_loss(self, data_dict, logits, item_seq=None, target=None):
+        if item_seq is None:
+            item_seq = data_dict['item_seq']
+        if target is None:
+            target = data_dict['target']
+
         if self.loss_type.upper() == 'BCE':
-            neg_item = self.get_negative_items(item_input, target, num_samples=1)
+            neg_item = self.get_negative_items(item_seq, target, num_samples=1)
             pos_score = torch.gather(logits, -1, target.unsqueeze(-1))
             neg_score = torch.gather(logits, -1, neg_item)
             loss = -torch.mean(F.logsigmoid(pos_score) + torch.log(1 - torch.sigmoid(neg_score)).sum(-1))
         elif self.loss_type.upper() == 'BPR':  # BPR loss
-            neg_item = self.get_negative_items(item_input, target, num_samples=1)
+            neg_item = self.get_negative_items(item_seq, target, num_samples=1)
             pos_score = torch.gather(logits, -1, target.unsqueeze(-1))
             neg_score = torch.gather(logits, -1, neg_item)
             loss = -torch.mean(F.logsigmoid(pos_score - neg_score))
-        else:  # CE loss
-            prediction = F.softmax(logits, -1)
-            pos_score = torch.gather(prediction, -1, target.unsqueeze(-1))
-            loss = -torch.mean(torch.log(pos_score))
+        elif self.loss_type.upper() == 'CE':  # CE loss
+            # prediction = F.softmax(logits, -1)
+            loss = self.cross_entropy(logits, target)
+            # pos_score = torch.gather(prediction, -1, target.unsqueeze(-1))
+            # loss = -torch.mean(torch.log(pos_score))
+        else:
+            loss = torch.zeros((1,)).to(self.dev)
         return loss
 
     def gather_index(self, output, index):
@@ -66,7 +70,7 @@ class AbstractRecommender(nn.Module):
         :param target_info: target information dict
         :return:
         """
-        target = target_info['target']   # [batch, ep_len]
+        target = target_info['target']  # [batch, ep_len]
         try:
             tar_len = target_info['target_len']
         except:
@@ -106,37 +110,19 @@ class AbstractRecommender(nn.Module):
         self.load_state_dict(pretrain_model.state_dict())
         del pretrain_model
 
-    def MISP_pretrain_forward(self, masked_item_sequence, pos_items, neg_items,
-                              masked_segment_sequence, pos_segment, neg_segment):
-        """
-        :param masked_item_sequence: [batch, max_len]
-        :param pos_items: [batch, max_len]
-        :param neg_items: [batch, max_len]
-        :return: pretraining task loss
-        """
+    def MISP_pretrain_forward(self, data_dict: dict):
         pass
 
-    def MIM_pretrain_forward(self, aug_seq_1, aug_seq_2, aug_len_1, aug_len_2):
-        """
-        :param aug_seq_1: [batch, max_len]
-        :param aug_seq_2: [batch, max_len]
-        :param aug_len_1: [batch]
-        :param aug_len_2: [batch
-        """
+    def MIM_pretrain_forward(self, data_dict: dict):
         pass
 
-    def PID_pretrain_forward(self, pseudo_seq, target):
-        """
-        :param pseudo_seq: [batch, max_len]
-        :param target: [batch, max_len]
-        :return:
-        """
+    def PID_pretrain_forward(self, data_dict: dict):
         pass
 
 
 class AbstractRLRecommender(AbstractRecommender):
-    def __init__(self, num_items=0, config=None):
-        super(AbstractRLRecommender, self).__init__(num_items, config)
+    def __init__(self, config):
+        super(AbstractRLRecommender, self).__init__(config)
 
     def sample_neg_action(self, masked_action, neg_size):
         """
@@ -175,4 +161,3 @@ class AbstractRLRecommender(AbstractRecommender):
         new_seq_len[new_seq_len > max_len] = max_len
 
         return new_item_seq, new_seq_len
-

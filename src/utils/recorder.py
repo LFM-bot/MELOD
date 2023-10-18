@@ -10,8 +10,9 @@ import numpy as np
 class Recorder:
     def __init__(self, config):
         self.epoch = 0
-        self.model = config.model
+        self.model_name = config.model
         self.dataset = config.dataset
+        self.run_mark = config.mark
         self.log_path = config.log_save
         # metric
         self.metrics = config.metric
@@ -21,12 +22,13 @@ class Recorder:
         self.metric_records = {}
         self.time_record = {'train': 0., 'eval': 0.}
         self.decimal_round = 4
-        self.model_saving = None
+        self.mark = config.mark
+        self.model_saved = config.model_saved
 
         # early stop
         self.early_stop = False
         self.core_metric = config.valid_metric
-        self.patience = config.patience
+        self.patience = int(config.patience)
         self.best_metric_rec = {'epoch': 0, 'score': 0.}
         self.step_2_stop = self.patience
         # log report
@@ -45,24 +47,26 @@ class Recorder:
 
     def _model_saving_init(self, config):
         # check saving path
-        if not os.path.exists(config.model_save):
-            os.mkdir(config.model_save)
+        if not os.path.exists(config.save):
+            os.mkdir(config.save)
         # init model saving path
         curr_time = datetime.datetime.now()
         timestamp = datetime.datetime.strftime(curr_time, '%Y-%m-%d_%H-%M-%S')
-        self.model_saving = config.model_save + f'\\{config.model}-{self.dataset}-{timestamp}.pth'
-        logging.info(f'model save at: {self.model_saving}')
+        if self.model_saved is None:
+            self.model_saved = config.save + f'\\{config.model}-{self.dataset}-{self.mark}-{timestamp}.pth'
+        logging.info(f'model save at: {self.model_saved}')
 
     def _init_log(self):
         save_path = os.path.join(self.log_path, self.dataset)
         if not os.path.isdir(save_path):
             os.makedirs(save_path)
         times = 1
-        log_file = os.path.join(save_path, '%s_%d.log' % (self.model, times))
+        log_model_name = self.model_name + f'-{self.run_mark}' if len(self.run_mark) > 0 else self.model_name
+        log_file = os.path.join(save_path, '%s_%d.log' % (log_model_name, times))
         for i in range(100):
             if not os.path.isfile(log_file):
                 break
-            log_file = os.path.join(save_path, '%s_%d.log' % (self.model, times + i + 1))
+            log_file = os.path.join(save_path, '%s_%d.log' % (log_model_name, times + i + 1))
 
         logging.basicConfig(
             format='%(asctime)s %(levelname)-8s %(message)s',
@@ -90,14 +94,14 @@ class Recorder:
         # torch.save(model, self.model_saving)
 
         # only save model parameters
-        torch.save(model.state_dict(), self.model_saving)
+        torch.save(model.state_dict(), self.model_saved)
 
     def load_best_model(self, model):
         # load entire model
         # return torch.load(self.model_saving)
 
         # load parameters
-        model.load_state_dict(torch.load(self.model_saving))
+        model.load_state_dict(torch.load(self.model_saved))
 
     def epoch_restart(self):
         self.batch_loss_rec = 0.
@@ -132,6 +136,7 @@ class Recorder:
             self.save_model(model)
         else:
             self.step_2_stop -= 1
+            logging.info(f'EarlyStopping Counter: {self.patience - self.step_2_stop} out of {self.patience}')
         if self.step_2_stop == 0:
             self.early_stop = True
 
@@ -141,7 +146,7 @@ class Recorder:
         output_str = " Training Time :[%.1f s]\tTraining Loss = %.4f" % (self.time_record['train'], training_loss)
         logging.info(output_str)
 
-    def eval_log_verbose(self, metric_score, eval_loss, model):
+    def log_verbose_and_save(self, metric_score, eval_loss, model):
         res_str = ''
         for metric, score in metric_score.items():
             score = str(round(score, self.decimal_round))
